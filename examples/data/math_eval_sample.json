@@ -1,0 +1,29 @@
+[
+  {
+    "problem": {
+      "question": "解这个数学题：2+3=?",
+      "answer": "5",
+      "student_steps": "首先计算2+3，得到5"
+    },
+    "answer": "正确性 1 每个步骤中所有计算过程均正确，并且最终答案与给定答案的一致。",
+    "images": []
+  },
+  {
+    "problem": {
+      "question": "计算：10-4=?",
+      "answer": "6", 
+      "student_steps": "10-4=7"
+    },
+    "answer": "正确性 0 计算过程有误，10-4应该等于6，而不是7。",
+    "images": []
+  },
+  {
+    "problem": {
+      "question": "求解：5×3=?",
+      "answer": "15",
+      "student_steps": "5×3=15，所以答案是15"
+    },
+    "answer": "正确性 1 计算过程正确，最终答案与给定答案一致。",
+    "images": []
+  }
+] 

@@ -49,6 +49,48 @@ from .core_algos import AdvantageEstimator, FixedKLController, KLController, com
 from .metrics import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics, reduce_metrics
 
 
+def compute_f1_metrics(predictions: List[int], ground_truths: List[int]) -> Dict[str, float]:
+    """
+    计算 F1 分数相关指标
+    
+    Args:
+        predictions: 预测值列表 (0 或 1)
+        ground_truths: 真实值列表 (0 或 1)
+        
+    Returns:
+        包含 precision, recall, f1_score 的字典
+    """
+    # 转换为 numpy 数组便于计算
+    pred_array = np.array(predictions)
+    true_array = np.array(ground_truths)
+    
+    # 计算混淆矩阵
+    tp = np.sum((pred_array == 1) & (true_array == 1))  # True Positive
+    fp = np.sum((pred_array == 0) & (true_array == 0))  # False Positive
+    fn = np.sum((pred_array == 0) & (true_array == 1))  # False Negative
+    tn = np.sum((pred_array == 1) & (true_array == 0))  # True Negative
+    
+    # 计算 precision, recall, f1
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    negative_predictive_value = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    f1_neg_score = 2 * (specificity * negative_predictive_value) / (specificity + negative_predictive_value) if (specificity + negative_predictive_value) > 0 else 0.0
+    # 计算准确率
+    accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) > 0 else 0.0
+    
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1_score": f1_score,
+        "accuracy": accuracy,
+        "specificity": specificity,
+        "negative_predictive_value": negative_predictive_value,
+        "f1_neg_score": f1_neg_score,
+    }
+
+
 class Role(IntEnum):
     """
     To create more roles dynamically, you can subclass Role and add new members
@@ -179,6 +221,8 @@ class RayPPOTrainer:
 
         self.val_reward_score = 0.0
         self.best_val_reward_score = -1.0
+        self.val_f1_neg_score = 0.0
+        self.best_f1_neg_score = -1.0
         self.best_global_step = None
 
         self.hybrid_engine = config.worker.hybrid_engine
@@ -303,9 +347,12 @@ class RayPPOTrainer:
 
     def _save_checkpoint(self) -> None:
         # path: {save_checkpoint_path}/global_step_{global_step}/{actor,critic}
-        if self.val_reward_score > self.best_val_reward_score:
-            self.best_val_reward_score = self.val_reward_score
+        # 使用 f1_neg_score 作为最佳模型的判断标准
+        if self.val_f1_neg_score > self.best_f1_neg_score:
+            self.best_f1_neg_score = self.val_f1_neg_score
+            self.best_val_reward_score = self.val_reward_score  # 保留原有指标用于记录
             self.best_global_step = self.global_step
+            print(f"New best model found at step {self.global_step} with F1 Negative Score: {self.best_f1_neg_score:.4f}")
 
         remove_obsolete_ckpt(
             self.config.trainer.save_checkpoint_path,
@@ -328,6 +375,8 @@ class RayPPOTrainer:
         checkpointer_tracker_info = {
             "best_global_step": self.best_global_step,
             "best_val_reward_score": round(self.best_val_reward_score, 4),
+            "best_f1_neg_score": round(self.best_f1_neg_score, 4),
+            "current_f1_neg_score": round(self.val_f1_neg_score, 4),
             "last_global_step": self.global_step,
             "last_actor_path": os.path.abspath(actor_path),
         }
@@ -380,6 +429,8 @@ class RayPPOTrainer:
         # Lists to collect samples for the table
         sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
         reward_metrics_lst = defaultdict(list)
+        # 添加用于 F1 计算的列表
+        all_predictions, all_ground_truths = [], []
         print("Start validation...")
         self.actor_rollout_ref_wg.prepare_rollout_engine()
         for batch_dict in self.val_dataloader:
@@ -416,16 +467,39 @@ class RayPPOTrainer:
             sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
             sample_scores.extend(scores)
 
+            # 收集预测值和真实值用于 F1 计算
+            if "prediction" in reward_metrics and "ground_truth" in reward_metrics:
+                all_predictions.extend(reward_metrics["prediction"])
+                all_ground_truths.extend(reward_metrics["ground_truth"])
+
             reward_tensor_lst.append(reward_tensor)
             for key, value in reward_metrics.items():
                 reward_metrics_lst[key].extend(value)
 
         self.actor_rollout_ref_wg.release_rollout_engine()
         self._maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
+        
+        # 保持原有的 reward score 计算
         self.val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
         val_reward_metrics = {f"val/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}
+        
+        # 添加 F1 分数计算
+        f1_metrics = {}
+        if all_predictions and all_ground_truths:
+            try:
+                f1_results = compute_f1_metrics(all_predictions, all_ground_truths)
+                f1_metrics = {f"val/{key}": value for key, value in f1_results.items()}
+                # 更新当前的 f1_neg_score 用于 checkpoint 保存
+                self.val_f1_neg_score = f1_results['f1_neg_score']
+                print(f"F1 Score: {f1_results['f1_score']:.4f}, Precision: {f1_results['precision']:.4f}, Recall: {f1_results['recall']:.4f}, Specificity: {f1_results['specificity']:.4f}, Negative Predictive Value: {f1_results['negative_predictive_value']:.4f}, F1 Negative Score: {f1_results['f1_neg_score']:.4f}")
+            except Exception as e:
+                print(f"Error computing F1 metrics: {e}")
+                self.val_f1_neg_score = 0.0  # 如果计算失败，设为 0
+        else:
+            self.val_f1_neg_score = 0.0  # 如果没有预测数据，设为 0
+        
         print("Finish validation.")
-        return {"val/reward_score": self.val_reward_score, **val_reward_metrics}
+        return {"val/reward_score": self.val_reward_score, **val_reward_metrics, **f1_metrics}
 
     def _balance_batch(self, batch: DataProto, metrics: Dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
